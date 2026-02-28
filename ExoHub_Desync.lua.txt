@@ -1,0 +1,611 @@
+-- ╔═══════════════════════════════════╗
+--   EXO HUB | Desync
+--   Ghost + Loop Desync
+--   discord.gg/6QzV9pTWs
+-- ╚═══════════════════════════════════╝
+
+local Players = game:GetService("Players")
+local RunService = game:GetService("RunService")
+local TweenService = game:GetService("TweenService")
+local UserInputService = game:GetService("UserInputService")
+local lp = Players.LocalPlayer
+
+-- ══════════════════════════════════════
+--  STATE
+-- ══════════════════════════════════════
+local desyncEnabled = false
+local anchorCFrame = nil
+local ghostModel = nil
+local freezeTime = 2.5   -- seconds frozen
+local syncTime = 0.4     -- seconds synced (so server doesn't kick)
+local loopConn = nil
+local minimised = false
+local FULL_H = 290
+local MINI_H = 46
+
+-- ══════════════════════════════════════
+--  GHOST MODEL — transparent copy of character
+-- ══════════════════════════════════════
+local function destroyGhost()
+    if ghostModel then
+        ghostModel:Destroy()
+        ghostModel = nil
+    end
+end
+
+local function createGhost(anchorCF)
+    destroyGhost()
+    local char = lp.Character
+    if not char then return end
+
+    ghostModel = Instance.new("Model")
+    ghostModel.Name = "ExoGhost"
+    ghostModel.Parent = workspace
+
+    for _, part in ipairs(char:GetDescendants()) do
+        if part:IsA("BasePart") then
+            local clone = Instance.new("Part")
+            clone.Size = part.Size
+            clone.CFrame = part.CFrame
+            clone.Anchored = true
+            clone.CanCollide = false
+            clone.CanQuery = false
+            clone.CastShadow = false
+            clone.Material = Enum.Material.Neon
+            clone.Color = Color3.fromRGB(0, 180, 255)
+            clone.Transparency = 0.55
+            clone.Name = part.Name
+            clone.Parent = ghostModel
+
+            -- copy shape
+            if part:IsA("SpecialMesh") then
+                part:Clone().Parent = clone
+            end
+            for _, m in ipairs(part:GetChildren()) do
+                if m:IsA("SpecialMesh") or m:IsA("DataModelMesh") then
+                    m:Clone().Parent = clone
+                end
+            end
+        end
+    end
+
+    -- position ghost at anchor
+    local hrp = char:FindFirstChild("HumanoidRootPart")
+    if hrp and anchorCF then
+        local offset = anchorCF:ToObjectSpace(hrp.CFrame)
+        for _, part in ipairs(char:GetDescendants()) do
+            if part:IsA("BasePart") then
+                local ghostPart = ghostModel:FindFirstChild(part.Name)
+                if ghostPart then
+                    ghostPart.CFrame = anchorCF * offset:ToObjectSpace(part.CFrame)
+                end
+            end
+        end
+    end
+
+    -- add a subtle glow outline
+    local sel = Instance.new("SelectionBox")
+    sel.Adornee = ghostModel
+    sel.Color3 = Color3.fromRGB(0, 200, 255)
+    sel.LineThickness = 0.04
+    sel.SurfaceTransparency = 1
+    sel.Parent = ghostModel
+end
+
+local function updateGhostPosition(anchorCF)
+    if not ghostModel then return end
+    local char = lp.Character
+    if not char then return end
+    local hrp = char:FindFirstChild("HumanoidRootPart")
+    if not hrp or not anchorCF then return end
+
+    local rootOffset = anchorCF:ToObjectSpace(hrp.CFrame)
+    for _, part in ipairs(char:GetDescendants()) do
+        if part:IsA("BasePart") then
+            local ghostPart = ghostModel:FindFirstChild(part.Name)
+            if ghostPart then
+                local relCF = hrp.CFrame:ToObjectSpace(part.CFrame)
+                ghostPart.CFrame = anchorCF * rootOffset:Inverse() * rootOffset * relCF
+            end
+        end
+    end
+end
+
+-- ══════════════════════════════════════
+--  DESYNC LOOP CORE
+-- ══════════════════════════════════════
+local function stopDesync()
+    desyncEnabled = false
+    if loopConn then loopConn:Disconnect() loopConn = nil end
+    destroyGhost()
+    anchorCFrame = nil
+    -- restore network ownership
+    local char = lp.Character
+    if char then
+        local hrp = char:FindFirstChild("HumanoidRootPart")
+        if hrp then
+            pcall(function() hrp:SetNetworkOwner(lp) end)
+        end
+    end
+end
+
+local function startDesync()
+    local char = lp.Character
+    if not char then return end
+    local hrp = char:FindFirstChild("HumanoidRootPart")
+    if not hrp then return end
+
+    -- set anchor to current position
+    anchorCFrame = hrp.CFrame
+    createGhost(anchorCFrame)
+    desyncEnabled = true
+
+    -- loop: freeze → sync → freeze
+    task.spawn(function()
+        while desyncEnabled do
+            -- FREEZE PHASE — lock HRP to anchor, server sees u frozen
+            local freezeStart = tick()
+            local freezeConn = RunService.Heartbeat:Connect(function()
+                if not desyncEnabled then return end
+                if hrp and hrp.Parent then
+                    pcall(function()
+                        hrp.CFrame = anchorCFrame
+                        hrp.AssemblyLinearVelocity = Vector3.zero
+                        hrp.AssemblyAngularVelocity = Vector3.zero
+                    end)
+                end
+            end)
+
+            -- update ghost to mirror your real body during freeze
+            local ghostConn = RunService.RenderStepped:Connect(function()
+                if ghostModel and anchorCFrame then
+                    updateGhostPosition(anchorCFrame)
+                end
+            end)
+
+            task.wait(freezeTime)
+            freezeConn:Disconnect()
+            ghostConn:Disconnect()
+
+            if not desyncEnabled then break end
+
+            -- SYNC PHASE — let position update so server doesnt kick
+            task.wait(syncTime)
+
+            if not desyncEnabled then break end
+
+            -- update anchor to wherever u actually are now
+            if hrp and hrp.Parent then
+                anchorCFrame = hrp.CFrame
+                -- reposition ghost
+                if ghostModel then
+                    for _, part in ipairs(char:GetDescendants()) do
+                        if part:IsA("BasePart") then
+                            local ghostPart = ghostModel:FindFirstChild(part.Name)
+                            if ghostPart then
+                                ghostPart.CFrame = part.CFrame
+                            end
+                        end
+                    end
+                end
+            end
+        end
+    end)
+end
+
+-- ══════════════════════════════════════
+--  GUI
+-- ══════════════════════════════════════
+if lp.PlayerGui:FindFirstChild("ExoDesyncUI") then
+    lp.PlayerGui.ExoDesyncUI:Destroy()
+end
+
+local SG = Instance.new("ScreenGui")
+SG.Name = "ExoDesyncUI"
+SG.ResetOnSpawn = false
+SG.DisplayOrder = 999
+SG.IgnoreGuiInset = true
+SG.Parent = lp.PlayerGui
+
+local W = Instance.new("Frame")
+W.Size = UDim2.new(0, 220, 0, FULL_H)
+W.Position = UDim2.new(0, 20, 0.5, -(FULL_H/2))
+W.BackgroundColor3 = Color3.fromRGB(5, 8, 20)
+W.BorderSizePixel = 0
+W.ClipsDescendants = true
+W.Active = true
+W.Draggable = true
+W.Parent = SG
+Instance.new("UICorner", W).CornerRadius = UDim.new(0, 14)
+
+local wStroke = Instance.new("UIStroke")
+wStroke.Color = Color3.fromRGB(0, 180, 255)
+wStroke.Thickness = 1.5
+wStroke.Transparency = 0.3
+wStroke.Parent = W
+
+local wGrad = Instance.new("UIGradient")
+wGrad.Color = ColorSequence.new({
+    ColorSequenceKeypoint.new(0,   Color3.fromRGB(5, 14, 36)),
+    ColorSequenceKeypoint.new(0.6, Color3.fromRGB(5, 8, 20)),
+    ColorSequenceKeypoint.new(1,   Color3.fromRGB(2, 4, 12)),
+})
+wGrad.Rotation = 135
+wGrad.Parent = W
+
+-- glow
+local glow = Instance.new("Frame")
+glow.Size = UDim2.new(0, 236, 0, FULL_H + 16)
+glow.AnchorPoint = Vector2.new(0.5, 0.5)
+glow.Position = UDim2.new(0, 20 + 110, 0.5, 0)
+glow.BackgroundColor3 = Color3.fromRGB(0, 160, 255)
+glow.BackgroundTransparency = 0.9
+glow.BorderSizePixel = 0
+glow.ZIndex = 0
+glow.Parent = SG
+Instance.new("UICorner", glow).CornerRadius = UDim.new(0, 18)
+
+-- TITLE BAR
+local TB = Instance.new("Frame")
+TB.Size = UDim2.new(1, 0, 0, 46)
+TB.BackgroundColor3 = Color3.fromRGB(4, 10, 28)
+TB.BorderSizePixel = 0
+TB.ZIndex = 2
+TB.Parent = W
+Instance.new("UICorner", TB).CornerRadius = UDim.new(0, 14)
+local TBFix = Instance.new("Frame")
+TBFix.Size = UDim2.new(1, 0, 0.5, 0)
+TBFix.Position = UDim2.new(0, 0, 0.5, 0)
+TBFix.BackgroundColor3 = Color3.fromRGB(4, 10, 28)
+TBFix.BorderSizePixel = 0
+TBFix.ZIndex = 2
+TBFix.Parent = TB
+
+local shim = Instance.new("Frame")
+shim.Size = UDim2.new(1, 0, 0, 2)
+shim.Position = UDim2.new(0, 0, 1, -2)
+shim.BorderSizePixel = 0
+shim.ZIndex = 3
+shim.Parent = TB
+local shimGrad = Instance.new("UIGradient")
+shimGrad.Color = ColorSequence.new({
+    ColorSequenceKeypoint.new(0,   Color3.fromRGB(0,0,0)),
+    ColorSequenceKeypoint.new(0.4, Color3.fromRGB(0,160,255)),
+    ColorSequenceKeypoint.new(0.6, Color3.fromRGB(100,220,255)),
+    ColorSequenceKeypoint.new(1,   Color3.fromRGB(0,0,0)),
+})
+shimGrad.Parent = shim
+task.spawn(function()
+    local t = 0
+    while SG.Parent do t += 0.025; shimGrad.Offset = Vector2.new(math.sin(t)*0.8,0); task.wait(0.03) end
+end)
+
+local iconBg = Instance.new("Frame")
+iconBg.Size = UDim2.new(0, 30, 0, 30)
+iconBg.Position = UDim2.new(0, 10, 0.5, -15)
+iconBg.BackgroundColor3 = Color3.fromRGB(0, 160, 255)
+iconBg.BackgroundTransparency = 0.5
+iconBg.BorderSizePixel = 0
+iconBg.ZIndex = 3
+iconBg.Parent = TB
+Instance.new("UICorner", iconBg).CornerRadius = UDim.new(0, 8)
+local iconLbl = Instance.new("TextLabel")
+iconLbl.Size = UDim2.new(1,0,1,0)
+iconLbl.BackgroundTransparency = 1
+iconLbl.Text = "👻"
+iconLbl.TextSize = 16
+iconLbl.Font = Enum.Font.GothamBold
+iconLbl.ZIndex = 4
+iconLbl.Parent = iconBg
+
+local titleLbl = Instance.new("TextLabel")
+titleLbl.Size = UDim2.new(1, -110, 0, 18)
+titleLbl.Position = UDim2.new(0, 48, 0, 6)
+titleLbl.BackgroundTransparency = 1
+titleLbl.Text = "DESYNC"
+titleLbl.Font = Enum.Font.GothamBlack
+titleLbl.TextSize = 16
+titleLbl.TextXAlignment = Enum.TextXAlignment.Left
+titleLbl.ZIndex = 3
+titleLbl.Parent = TB
+local tGrad = Instance.new("UIGradient")
+tGrad.Color = ColorSequence.new({
+    ColorSequenceKeypoint.new(0,   Color3.fromRGB(0, 200, 255)),
+    ColorSequenceKeypoint.new(0.5, Color3.fromRGB(255, 255, 255)),
+    ColorSequenceKeypoint.new(1,   Color3.fromRGB(0, 140, 220)),
+})
+tGrad.Rotation = 90
+tGrad.Parent = titleLbl
+
+local subLbl = Instance.new("TextLabel")
+subLbl.Size = UDim2.new(1, -110, 0, 13)
+subLbl.Position = UDim2.new(0, 48, 0, 26)
+subLbl.BackgroundTransparency = 1
+subLbl.Text = "EXO HUB  •  Ghost Mode"
+subLbl.Font = Enum.Font.Gotham
+subLbl.TextSize = 9
+subLbl.TextColor3 = Color3.fromRGB(40, 100, 160)
+subLbl.TextXAlignment = Enum.TextXAlignment.Left
+subLbl.ZIndex = 3
+subLbl.Parent = TB
+
+-- minimise
+local minBtn = Instance.new("TextButton")
+minBtn.Size = UDim2.new(0, 24, 0, 24)
+minBtn.Position = UDim2.new(1, -58, 0.5, -12)
+minBtn.BackgroundColor3 = Color3.fromRGB(8, 16, 40)
+minBtn.Text = "─"
+minBtn.TextColor3 = Color3.fromRGB(0, 180, 255)
+minBtn.Font = Enum.Font.GothamBold
+minBtn.TextSize = 12
+minBtn.BorderSizePixel = 0
+minBtn.ZIndex = 4
+minBtn.Parent = TB
+Instance.new("UICorner", minBtn).CornerRadius = UDim.new(0, 6)
+Instance.new("UIStroke", minBtn).Color = Color3.fromRGB(0, 80, 160)
+
+local closeBtn = Instance.new("TextButton")
+closeBtn.Size = UDim2.new(0, 24, 0, 24)
+closeBtn.Position = UDim2.new(1, -30, 0.5, -12)
+closeBtn.BackgroundColor3 = Color3.fromRGB(200, 40, 60)
+closeBtn.Text = "✕"
+closeBtn.TextColor3 = Color3.fromRGB(255,255,255)
+closeBtn.Font = Enum.Font.GothamBold
+closeBtn.TextSize = 11
+closeBtn.BorderSizePixel = 0
+closeBtn.ZIndex = 4
+closeBtn.Parent = TB
+Instance.new("UICorner", closeBtn).CornerRadius = UDim.new(0, 6)
+
+closeBtn.MouseButton1Click:Connect(function()
+    stopDesync()
+    SG:Destroy()
+end)
+
+minBtn.MouseButton1Click:Connect(function()
+    minimised = not minimised
+    minBtn.Text = minimised and "+" or "─"
+    TweenService:Create(W, TweenInfo.new(0.3, Enum.EasingStyle.Quart, Enum.EasingDirection.Out), {
+        Size = UDim2.new(0, 220, 0, minimised and MINI_H or FULL_H)
+    }):Play()
+end)
+
+-- ══════════════════════════════════════
+--  TOGGLE BUTTON
+-- ══════════════════════════════════════
+local toggleBtn = Instance.new("TextButton")
+toggleBtn.Size = UDim2.new(1, -20, 0, 44)
+toggleBtn.Position = UDim2.new(0, 10, 0, 54)
+toggleBtn.BackgroundColor3 = Color3.fromRGB(8, 16, 40)
+toggleBtn.Text = "👻  DESYNC  —  OFF"
+toggleBtn.TextColor3 = Color3.fromRGB(0, 160, 220)
+toggleBtn.Font = Enum.Font.GothamBold
+toggleBtn.TextSize = 13
+toggleBtn.BorderSizePixel = 0
+toggleBtn.ZIndex = 2
+toggleBtn.Parent = W
+Instance.new("UICorner", toggleBtn).CornerRadius = UDim.new(0, 10)
+local togStroke = Instance.new("UIStroke")
+togStroke.Color = Color3.fromRGB(0, 80, 140)
+togStroke.Thickness = 1
+togStroke.Parent = toggleBtn
+
+toggleBtn.MouseButton1Click:Connect(function()
+    if desyncEnabled then
+        stopDesync()
+        toggleBtn.Text = "👻  DESYNC  —  OFF"
+        TweenService:Create(toggleBtn, TweenInfo.new(0.25), {BackgroundColor3 = Color3.fromRGB(8,16,40)}):Play()
+        TweenService:Create(toggleBtn, TweenInfo.new(0.25), {TextColor3 = Color3.fromRGB(0,160,220)}):Play()
+        TweenService:Create(togStroke, TweenInfo.new(0.25), {Color = Color3.fromRGB(0,80,140)}):Play()
+    else
+        startDesync()
+        toggleBtn.Text = "👻  DESYNC  —  ON ✓"
+        TweenService:Create(toggleBtn, TweenInfo.new(0.25), {BackgroundColor3 = Color3.fromRGB(0,100,180)}):Play()
+        TweenService:Create(toggleBtn, TweenInfo.new(0.25), {TextColor3 = Color3.fromRGB(255,255,255)}):Play()
+        TweenService:Create(togStroke, TweenInfo.new(0.25), {Color = Color3.fromRGB(0,200,255)}):Play()
+    end
+end)
+
+-- UPDATE ANCHOR button
+local anchorBtn = Instance.new("TextButton")
+anchorBtn.Size = UDim2.new(1, -20, 0, 36)
+anchorBtn.Position = UDim2.new(0, 10, 0, 106)
+anchorBtn.BackgroundColor3 = Color3.fromRGB(6, 12, 30)
+anchorBtn.Text = "📍  Update Ghost Position"
+anchorBtn.TextColor3 = Color3.fromRGB(100, 180, 220)
+anchorBtn.Font = Enum.Font.GothamBold
+anchorBtn.TextSize = 11
+anchorBtn.BorderSizePixel = 0
+anchorBtn.ZIndex = 2
+anchorBtn.Parent = W
+Instance.new("UICorner", anchorBtn).CornerRadius = UDim.new(0, 10)
+Instance.new("UIStroke", anchorBtn).Color = Color3.fromRGB(0, 60, 120)
+
+anchorBtn.MouseButton1Click:Connect(function()
+    if not desyncEnabled then return end
+    local hrp = lp.Character and lp.Character:FindFirstChild("HumanoidRootPart")
+    if hrp then
+        anchorCFrame = hrp.CFrame
+        -- reposition ghost parts instantly
+        local char = lp.Character
+        if ghostModel and char then
+            for _, part in ipairs(char:GetDescendants()) do
+                if part:IsA("BasePart") then
+                    local gp = ghostModel:FindFirstChild(part.Name)
+                    if gp then gp.CFrame = part.CFrame end
+                end
+            end
+        end
+        -- flash button green
+        TweenService:Create(anchorBtn, TweenInfo.new(0.15), {BackgroundColor3 = Color3.fromRGB(0,120,60)}):Play()
+        task.delay(0.4, function()
+            TweenService:Create(anchorBtn, TweenInfo.new(0.2), {BackgroundColor3 = Color3.fromRGB(6,12,30)}):Play()
+        end)
+    end
+end)
+
+-- ══════════════════════════════════════
+--  FREEZE TIME SLIDER
+-- ══════════════════════════════════════
+local function makeSlider(labelTxt, yPos, minVal, maxVal, defaultVal, onChange)
+    local lbl = Instance.new("TextLabel")
+    lbl.Size = UDim2.new(1, -20, 0, 14)
+    lbl.Position = UDim2.new(0, 10, 0, yPos)
+    lbl.BackgroundTransparency = 1
+    lbl.Text = labelTxt
+    lbl.Font = Enum.Font.GothamBold
+    lbl.TextSize = 10
+    lbl.TextColor3 = Color3.fromRGB(0, 150, 210)
+    lbl.TextXAlignment = Enum.TextXAlignment.Left
+    lbl.ZIndex = 2
+    lbl.Parent = W
+
+    local valLbl = Instance.new("TextLabel")
+    valLbl.Size = UDim2.new(0, 40, 0, 14)
+    valLbl.Position = UDim2.new(1, -50, 0, yPos)
+    valLbl.BackgroundTransparency = 1
+    valLbl.Text = tostring(defaultVal) .. "s"
+    valLbl.Font = Enum.Font.GothamBold
+    valLbl.TextSize = 10
+    valLbl.TextColor3 = Color3.fromRGB(0, 200, 255)
+    valLbl.TextXAlignment = Enum.TextXAlignment.Right
+    valLbl.ZIndex = 2
+    valLbl.Parent = W
+
+    local track = Instance.new("Frame")
+    track.Size = UDim2.new(1, -20, 0, 6)
+    track.Position = UDim2.new(0, 10, 0, yPos + 18)
+    track.BackgroundColor3 = Color3.fromRGB(10, 18, 44)
+    track.BorderSizePixel = 0
+    track.ZIndex = 2
+    track.Parent = W
+    Instance.new("UICorner", track).CornerRadius = UDim.new(1, 0)
+
+    local ratio = (defaultVal - minVal) / (maxVal - minVal)
+
+    local fill = Instance.new("Frame")
+    fill.Size = UDim2.new(ratio, 0, 1, 0)
+    fill.BackgroundColor3 = Color3.fromRGB(0, 180, 255)
+    fill.BorderSizePixel = 0
+    fill.ZIndex = 3
+    fill.Parent = track
+    Instance.new("UICorner", fill).CornerRadius = UDim.new(1, 0)
+    local fg = Instance.new("UIGradient")
+    fg.Color = ColorSequence.new({ColorSequenceKeypoint.new(0,Color3.fromRGB(0,120,200)),ColorSequenceKeypoint.new(1,Color3.fromRGB(80,220,255))})
+    fg.Parent = fill
+
+    local knob = Instance.new("Frame")
+    knob.Size = UDim2.new(0, 14, 0, 14)
+    knob.AnchorPoint = Vector2.new(0.5, 0.5)
+    knob.Position = UDim2.new(ratio, 0, 0.5, 0)
+    knob.BackgroundColor3 = Color3.fromRGB(0, 200, 255)
+    knob.BorderSizePixel = 0
+    knob.ZIndex = 4
+    knob.Parent = track
+    Instance.new("UICorner", knob).CornerRadius = UDim.new(1, 0)
+
+    local dragging = false
+    knob.InputBegan:Connect(function(i) if i.UserInputType == Enum.UserInputType.MouseButton1 then dragging = true end end)
+    UserInputService.InputEnded:Connect(function(i) if i.UserInputType == Enum.UserInputType.MouseButton1 then dragging = false end end)
+    UserInputService.InputChanged:Connect(function(i)
+        if dragging and i.UserInputType == Enum.UserInputType.MouseMovement then
+            local rx = math.clamp((i.Position.X - track.AbsolutePosition.X) / track.AbsoluteSize.X, 0, 1)
+            local val = math.floor((minVal + rx * (maxVal - minVal)) * 10) / 10
+            valLbl.Text = tostring(val) .. "s"
+            fill.Size = UDim2.new(rx, 0, 1, 0)
+            knob.Position = UDim2.new(rx, 0, 0.5, 0)
+            onChange(val)
+        end
+    end)
+end
+
+makeSlider("Freeze Duration", 154, 0.5, 10, freezeTime, function(v) freezeTime = v end)
+makeSlider("Sync Window",     202, 0.2, 2,  syncTime,   function(v) syncTime = v end)
+
+-- status label
+local statusLbl = Instance.new("TextLabel")
+statusLbl.Size = UDim2.new(1, -20, 0, 20)
+statusLbl.Position = UDim2.new(0, 10, 0, 256)
+statusLbl.BackgroundTransparency = 1
+statusLbl.Text = "⚫  Desync inactive"
+statusLbl.Font = Enum.Font.GothamBold
+statusLbl.TextSize = 11
+statusLbl.TextColor3 = Color3.fromRGB(60, 90, 130)
+statusLbl.TextXAlignment = Enum.TextXAlignment.Center
+statusLbl.ZIndex = 2
+statusLbl.Parent = W
+
+-- watermark
+local wm = Instance.new("TextLabel")
+wm.Size = UDim2.new(1, -20, 0, 14)
+wm.Position = UDim2.new(0, 10, 1, -18)
+wm.BackgroundTransparency = 1
+wm.Text = "discord.gg/6QzV9pTWs"
+wm.Font = Enum.Font.Gotham
+wm.TextSize = 10
+wm.TextColor3 = Color3.fromRGB(0, 50, 90)
+wm.TextXAlignment = Enum.TextXAlignment.Center
+wm.ZIndex = 2
+wm.Parent = W
+
+-- ══════════════════════════════════════
+--  STATUS UPDATER
+-- ══════════════════════════════════════
+local statusPhase = ""
+task.spawn(function()
+    while SG.Parent do
+        if desyncEnabled then
+            -- figure out phase from loop timing
+            statusLbl.TextColor3 = Color3.fromRGB(0, 200, 255)
+            statusLbl.Text = "🔵  Ghost active — they see your anchor"
+        else
+            statusLbl.TextColor3 = Color3.fromRGB(60, 90, 130)
+            statusLbl.Text = "⚫  Desync inactive"
+        end
+        task.wait(0.2)
+    end
+end)
+
+-- ══════════════════════════════════════
+--  PULSE ANIMATION
+-- ══════════════════════════════════════
+local t = 0
+RunService.Heartbeat:Connect(function(dt)
+    if not SG.Parent then return end
+    t += dt
+    local pulse = (math.sin(t * 2.5) + 1) / 2
+    local slow  = (math.sin(t * 1.0) + 1) / 2
+
+    if desyncEnabled then
+        wStroke.Transparency = 0.05 * pulse
+        wStroke.Thickness = 1.5 + pulse * 0.8
+        glow.BackgroundTransparency = 0.78 + slow * 0.12
+        glow.BackgroundColor3 = Color3.fromRGB(0, 140 + slow*40, 220 + slow*35)
+    else
+        wStroke.Transparency = 0.3 + pulse * 0.3
+        wStroke.Thickness = 1.5
+        glow.BackgroundTransparency = 0.92
+    end
+
+    tGrad.Rotation = (t * 22) % 360
+end)
+
+-- ══════════════════════════════════════
+--  CLEANUP ON RESPAWN
+-- ══════════════════════════════════════
+lp.CharacterAdded:Connect(function()
+    stopDesync()
+    toggleBtn.Text = "👻  DESYNC  —  OFF"
+    toggleBtn.BackgroundColor3 = Color3.fromRGB(8,16,40)
+    toggleBtn.TextColor3 = Color3.fromRGB(0,160,220)
+end)
+
+-- ══════════════════════════════════════
+--  OPEN ANIMATION
+-- ══════════════════════════════════════
+W.Position = UDim2.new(-0.5, 0, 0.5, -(FULL_H/2))
+TweenService:Create(W, TweenInfo.new(0.45, Enum.EasingStyle.Back, Enum.EasingDirection.Out), {
+    Position = UDim2.new(0, 20, 0.5, -(FULL_H/2))
+}):Play()
+
+print("[EXO HUB] Desync loaded | discord.gg/6QzV9pTWs")
